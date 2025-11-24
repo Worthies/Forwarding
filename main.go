@@ -14,11 +14,11 @@ import (
 )
 
 var (
-	portMappings  arrayFlags
-	detectIPAddr  string
-	listenAddr    string
-	bufferSize    = 32 * 1024 // 32KB buffer for high performance
-	bufferPool    = sync.Pool{
+	portMappings arrayFlags
+	detectIPAddr string
+	listenAddr   string
+	bufferSize   = 32 * 1024 // 32KB buffer for high performance
+	bufferPool   = sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, bufferSize)
 			return &buf
@@ -115,7 +115,7 @@ func parsePortMappings(flags []string) []PortMapping {
 			}
 			publicPort := strings.TrimSpace(portPair[0])
 			privatePort := strings.TrimSpace(portPair[1])
-			
+
 			// Validate port numbers
 			if !isValidPort(publicPort) {
 				log.Printf("Warning: invalid public port '%s', skipping", publicPort)
@@ -125,7 +125,7 @@ func parsePortMappings(flags []string) []PortMapping {
 				log.Printf("Warning: invalid private port '%s', skipping", privatePort)
 				continue
 			}
-			
+
 			mappings = append(mappings, PortMapping{
 				PublicPort:  publicPort,
 				PrivatePort: privatePort,
