@@ -5,7 +5,7 @@ A high-performance TCP connection forwarding tool written in Go. Forward traffic
 ## Features
 
 - **High Performance**: Uses 32KB buffers, TCP NoDelay, and buffer pooling for optimal throughput
-- **Auto Public IP Detection**: Automatically detects your public IP address
+- **Auto Outbound Interface Detection**: Detects the local interface IP used to reach the public Internet and uses that for binding listeners; it also detects the external public IP (for informational/logging purposes) but does not bind to the external public IP (which may belong to a load balancer or NAT).
 - **Multiple Port Mappings**: Support for forwarding multiple ports simultaneously
 - **Flexible Configuration**: Comma-separated or multiple `-p` flags for port mappings
 - **TCP Keepalive**: Built-in connection management with TCP keepalive
@@ -34,8 +34,8 @@ forwarding -p <public_port:private_port> [-d <detect_ip>] [-l <listen_addr>]
 ### Options
 
 - `-p`: Port mapping in format 'public:private' (can be specified multiple times or comma-separated)
-- `-d`: Optional IP address to use for detecting public IP (default: auto-detect)
-- `-l`: Optional listen address (default: auto-detected public IP, use 0.0.0.0 for all interfaces)
+- `-d`: Optional local interface IP to use as the source for public IP detection (instead of auto-detecting the outbound interface). This is not the external/public IP.
+- `-l`: Optional listen address (default: auto-detected local outbound interface IP; use 0.0.0.0 for all interfaces)
 
 ### Examples
 
@@ -66,8 +66,8 @@ forwarding -p 8080:80 -d 192.168.1.100
 
 ## How It Works
 
-1. The tool detects your public IP address (or uses the specified listen address)
-2. It binds to the detected or specified IP address on the public port(s)
+1. The tool detects the local outbound interface IP used to reach the public Internet, and optionally the public IP.
+2. It binds to the detected (or explicitly specified) local interface IP (not the external public IP) on the public port(s)
 3. When a connection is received, it forwards the traffic to `127.0.0.1:<private_port>`
 4. Data is bidirectionally forwarded between the public and private connections
 5. Connections are managed with TCP keepalive and proper cleanup
