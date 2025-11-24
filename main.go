@@ -50,7 +50,7 @@ type PortMapping struct {
 func main() {
 	flag.Var(&portMappings, "p", "Port mapping in format 'public:private' (can be specified multiple times or comma-separated)")
 	flag.StringVar(&detectIPAddr, "d", "", "Optional local IP address to use for outbound detection (default: auto-detect via Google DNS addresses: 8.8.8.8, 8.8.4.4, 2001:4860:4860::8888, 2001:4860:4860::8844)")
-	flag.StringVar(&listenAddr, "l", "", "Optional listen address (default: auto-detected public IP, use 0.0.0.0 for all interfaces)")
+	flag.StringVar(&listenAddr, "l", "", "Optional listen address (default: auto-detected local outbound interface IP; use 0.0.0.0 for all interfaces)")
 	flag.Parse()
 
 	if len(portMappings) == 0 {
@@ -62,21 +62,43 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Determine the listen address
-	var publicIP string
+	// Determine the bind/listen address
+	var bindIP string
 	if listenAddr != "" {
-		publicIP = listenAddr
-		log.Printf("Using specified listen address: %s", publicIP)
+		// If user explicitly specified a listen address (not 0.0.0.0), ensure
+		// it is a local interface address; otherwise fail early.
+		if listenAddr != "0.0.0.0" && !isLocalIP(listenAddr) {
+			log.Fatalf("Specified listen address '%s' is not a local interface address", listenAddr)
+		}
+		bindIP = listenAddr
+		log.Printf("Using specified listen address: %s", bindIP)
 	} else {
-		// Detect public IP
-		ip, err := detectPublicIP(detectIPAddr)
+		// Detect the best local interface to use for public network outbound
+		// communication, and bind the listeners to that local interface.
+		// We still attempt to detect the external public IP for logging, but
+		// we should not bind to the external public IP (it might be a LB or NAT).
+		outboundIP, _ := detectOutboundLocalIP([]string{"8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"}, 2*time.Second)
+		if outboundIP != "" {
+			bindIP = outboundIP
+			log.Printf("Using outbound local interface IP as listen address: %s", bindIP)
+		} else {
+			// Fallback to wildcard listen address if we can't determine the
+			// outbound interface; this is uncommon but acceptable if the host
+			// needs to listen on all interfaces.
+			bindIP = "0.0.0.0"
+			log.Printf("Could not detect outbound local interface; falling back to all interfaces (0.0.0.0)")
+		}
+
+		// Try to detect the external public IP for reporting purposes. We
+		// pass the outbound local IP (if available) as the source so the
+		// detection uses the same outbound interface.
+		ip, err := detectPublicIP(outboundIP)
 		if err != nil {
 			log.Printf("Warning: Failed to detect public IP: %v", err)
-			log.Printf("Falling back to listening on all interfaces (0.0.0.0)")
-			publicIP = "0.0.0.0"
 		} else {
-			publicIP = ip
-			log.Printf("Detected public IP: %s", publicIP)
+			// Log the detected public IP, but still bind to the local interface
+			// IP to which we'll attach listeners.
+			log.Printf("Detected public IP: %s", ip)
 		}
 	}
 
@@ -96,9 +118,9 @@ func main() {
 		wg.Add(1)
 		go func(m PortMapping) {
 			defer wg.Done()
-			if err := startForwarding(ctx, publicIP, m); err != nil {
+			if err := startForwarding(ctx, bindIP, m); err != nil {
 				log.Printf("Error forwarding %s:%s -> 127.0.0.1:%s: %v",
-					publicIP, m.PublicPort, m.PrivatePort, err)
+					bindIP, m.PublicPort, m.PrivatePort, err)
 			}
 		}(mapping)
 	}
@@ -294,8 +316,48 @@ func detectOutboundLocalIP(targets []string, timeout time.Duration) (string, err
 	return "", fmt.Errorf("no valid target responded")
 }
 
-func startForwarding(ctx context.Context, publicIP string, mapping PortMapping) error {
-	listenAddr := fmt.Sprintf("%s:%s", publicIP, mapping.PublicPort)
+// isLocalIP checks whether the provided ipStr matches any local interface address
+// on the host. It returns true if a matching address exists.
+func isLocalIP(ipStr string) bool {
+	if ipStr == "" {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("Warning: failed to enumerate network interfaces: %v", err)
+		return false
+	}
+	for _, iface := range ifaces {
+		// Skip down interfaces
+		if (iface.Flags & net.FlagUp) == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if v.IP.Equal(ip) {
+					return true
+				}
+			case *net.IPAddr:
+				if v.IP.Equal(ip) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func startForwarding(ctx context.Context, bindIP string, mapping PortMapping) error {
+	listenAddr := fmt.Sprintf("%s:%s", bindIP, mapping.PublicPort)
 	forwardAddr := fmt.Sprintf("127.0.0.1:%s", mapping.PrivatePort)
 
 	listener, err := net.Listen("tcp", listenAddr)
