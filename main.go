@@ -18,6 +18,12 @@ var (
 	detectIPAddr  string
 	listenAddr    string
 	bufferSize    = 32 * 1024 // 32KB buffer for high performance
+	bufferPool    = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, bufferSize)
+			return &buf
+		},
+	}
 )
 
 type arrayFlags []string
@@ -107,13 +113,36 @@ func parsePortMappings(flags []string) []PortMapping {
 				log.Printf("Warning: invalid port mapping format '%s', skipping", part)
 				continue
 			}
+			publicPort := strings.TrimSpace(portPair[0])
+			privatePort := strings.TrimSpace(portPair[1])
+			
+			// Validate port numbers
+			if !isValidPort(publicPort) {
+				log.Printf("Warning: invalid public port '%s', skipping", publicPort)
+				continue
+			}
+			if !isValidPort(privatePort) {
+				log.Printf("Warning: invalid private port '%s', skipping", privatePort)
+				continue
+			}
+			
 			mappings = append(mappings, PortMapping{
-				PublicPort:  strings.TrimSpace(portPair[0]),
-				PrivatePort: strings.TrimSpace(portPair[1]),
+				PublicPort:  publicPort,
+				PrivatePort: privatePort,
 			})
 		}
 	}
 	return mappings
+}
+
+func isValidPort(port string) bool {
+	// Parse port number
+	var portNum int
+	_, err := fmt.Sscanf(port, "%d", &portNum)
+	if err != nil {
+		return false
+	}
+	return portNum >= 1 && portNum <= 65535
 }
 
 func detectPublicIP(sourceIP string) (string, error) {
@@ -157,14 +186,15 @@ func detectPublicIP(sourceIP string) (string, error) {
 			lastErr = err
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("service %s returned status %d", service, resp.StatusCode)
 			continue
 		}
 
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			continue
@@ -254,6 +284,7 @@ func handleConnection(clientConn net.Conn, forwardAddr string) {
 }
 
 func copyWithBuffer(dst io.Writer, src io.Reader) {
-	buf := make([]byte, bufferSize)
-	io.CopyBuffer(dst, src, buf)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	io.CopyBuffer(dst, src, *bufPtr)
 }
