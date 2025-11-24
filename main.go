@@ -44,7 +44,7 @@ type PortMapping struct {
 
 func main() {
 	flag.Var(&portMappings, "p", "Port mapping in format 'public:private' (can be specified multiple times or comma-separated)")
-	flag.StringVar(&detectIPAddr, "d", "", "Optional IP address to use for detecting public IP (default: auto-detect)")
+	flag.StringVar(&detectIPAddr, "d", "", "Optional local IP address to use for outbound detection (default: auto-detect via Google DNS addresses: 8.8.8.8, 8.8.4.4, 2001:4860:4860::8888, 2001:4860:4860::8844)")
 	flag.StringVar(&listenAddr, "l", "", "Optional listen address (default: auto-detected public IP, use 0.0.0.0 for all interfaces)")
 	flag.Parse()
 
@@ -146,6 +146,30 @@ func isValidPort(port string) bool {
 }
 
 func detectPublicIP(sourceIP string) (string, error) {
+	// If sourceIP isn't provided, attempt to auto-detect the outbound local
+	// IP by making a short UDP/TCP connection to a set of known public DNS
+	// endpoints (Google DNS). This heuristic helps select the correct
+	// outbound interface on multi-homed systems so that subsequent HTTP
+	// requests use the same routing path.
+	if sourceIP == "" {
+		// Try Google public DNS endpoints (IPv4 and IPv6) as defaults.
+		defaultTargets := []string{
+			"8.8.8.8",
+			"8.8.4.4",
+			"2001:4860:4860::8888",
+			"2001:4860:4860::8844",
+		}
+		if detected, err := detectOutboundLocalIP(defaultTargets, 2*time.Second); err == nil && detected != "" {
+			sourceIP = detected
+			log.Printf("Auto-detected outbound local IP: %s (using %v)", sourceIP, defaultTargets)
+		} else {
+			// Not fatal: continue with sourceIP empty and let the HTTP client
+			// pick the default source address.
+			if err != nil {
+				log.Printf("Warning: failed to auto-detect outbound local IP: %v", err)
+			}
+		}
+	}
 	// Create HTTP client with custom transport
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
@@ -208,6 +232,44 @@ func detectPublicIP(sourceIP string) (string, error) {
 	}
 
 	return "", fmt.Errorf("failed to detect public IP: %v", lastErr)
+}
+
+// detectOutboundLocalIP tries to determine the local outbound IP used to
+// reach remote targets by opening a short UDP or TCP connection and returning
+// the local address portion. It returns the first successful local IP.
+func detectOutboundLocalIP(targets []string, timeout time.Duration) (string, error) {
+	var lastErr error
+	for _, target := range targets {
+		// First try UDP (DNS); many networks allow outbound UDP for DNS.
+		addr := net.JoinHostPort(target, "53")
+		conn, err := net.DialTimeout("udp", addr, timeout)
+		if err == nil {
+			local := conn.LocalAddr()
+			conn.Close()
+			if udpAddr, ok := local.(*net.UDPAddr); ok && !udpAddr.IP.IsUnspecified() {
+				return udpAddr.IP.String(), nil
+			}
+		} else {
+			lastErr = err
+		}
+
+		// Try TCP (HTTPS) as a fallback.
+		addr = net.JoinHostPort(target, "443")
+		conn2, err2 := net.DialTimeout("tcp", addr, timeout)
+		if err2 == nil {
+			local := conn2.LocalAddr()
+			conn2.Close()
+			if tcpAddr, ok := local.(*net.TCPAddr); ok && !tcpAddr.IP.IsUnspecified() {
+				return tcpAddr.IP.String(), nil
+			}
+		} else {
+			lastErr = err2
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no valid target responded")
 }
 
 func startForwarding(publicIP string, mapping PortMapping) error {
