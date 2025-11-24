@@ -67,7 +67,7 @@ forwarding -p 8080:80 -d 192.168.1.100
 ## How It Works
 
 1. The tool detects your public IP address (or uses the specified listen address)
-2. It binds to the public interface on the specified public port(s)
+2. It binds to the detected or specified IP address on the public port(s)
 3. When a connection is received, it forwards the traffic to `127.0.0.1:<private_port>`
 4. Data is bidirectionally forwarded between the public and private connections
 5. Connections are managed with TCP keepalive and proper cleanup

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -8,8 +10,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -83,18 +88,38 @@ func main() {
 
 	// Start forwarding for each mapping
 	var wg sync.WaitGroup
+	// Create a cancellable context that will be canceled on SIGINT or SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	for _, mapping := range mappings {
 		wg.Add(1)
 		go func(m PortMapping) {
 			defer wg.Done()
-			if err := startForwarding(publicIP, m); err != nil {
+			if err := startForwarding(ctx, publicIP, m); err != nil {
 				log.Printf("Error forwarding %s:%s -> 127.0.0.1:%s: %v",
 					publicIP, m.PublicPort, m.PrivatePort, err)
 			}
 		}(mapping)
 	}
 
-	wg.Wait()
+	// Wait for cancel signal (SIGINT/SIGTERM)
+	<-ctx.Done()
+	log.Printf("Shutdown signal received, closing listeners and waiting for active connections to finish")
+
+	// Give forwarders some time to shut down gracefully
+	shutdownTimeout := 10 * time.Second
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("All forwarders shut down")
+	case <-time.After(shutdownTimeout):
+		log.Printf("Timeout waiting for forwarders to exit; forcing exit")
+	}
 }
 
 func parsePortMappings(flags []string) []PortMapping {
@@ -137,8 +162,7 @@ func parsePortMappings(flags []string) []PortMapping {
 
 func isValidPort(port string) bool {
 	// Parse port number
-	var portNum int
-	_, err := fmt.Sscanf(port, "%d", &portNum)
+	portNum, err := strconv.Atoi(port)
 	if err != nil {
 		return false
 	}
@@ -170,30 +194,28 @@ func detectPublicIP(sourceIP string) (string, error) {
 			}
 		}
 	}
-	// Create HTTP client with custom transport
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 10 * time.Second,
-		}).DialContext,
-	}
 
-	// If a specific source IP is provided, use it
+	var client *http.Client
 	if sourceIP != "" {
+		// Create custom transport with source IP binding
 		localAddr, err := net.ResolveTCPAddr("tcp", sourceIP+":0")
 		if err != nil {
 			return "", fmt.Errorf("invalid source IP: %v", err)
 		}
-		transport.DialContext = (&net.Dialer{
-			LocalAddr: localAddr,
-			Timeout:   10 * time.Second,
-			KeepAlive: 10 * time.Second,
-		}).DialContext
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
+		transport := &http.Transport{
+			DialContext: (&net.Dialer{
+				LocalAddr: localAddr,
+				Timeout:   10 * time.Second,
+				KeepAlive: 10 * time.Second,
+			}).DialContext,
+		}
+		client = &http.Client{
+			Transport: transport,
+			Timeout:   15 * time.Second,
+		}
+	} else {
+		// Use default client for standard case
+		client = http.DefaultClient
 	}
 
 	// Try multiple public IP detection services
@@ -272,7 +294,7 @@ func detectOutboundLocalIP(targets []string, timeout time.Duration) (string, err
 	return "", fmt.Errorf("no valid target responded")
 }
 
-func startForwarding(publicIP string, mapping PortMapping) error {
+func startForwarding(ctx context.Context, publicIP string, mapping PortMapping) error {
 	listenAddr := fmt.Sprintf("%s:%s", publicIP, mapping.PublicPort)
 	forwardAddr := fmt.Sprintf("127.0.0.1:%s", mapping.PrivatePort)
 
@@ -280,15 +302,41 @@ func startForwarding(publicIP string, mapping PortMapping) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", listenAddr, err)
 	}
-	defer listener.Close()
+	// Ensure the listener is closed when the function returns
+	closed := make(chan struct{})
+	defer func() {
+		listener.Close()
+		close(closed)
+	}()
 
 	log.Printf("Forwarding %s -> %s", listenAddr, forwardAddr)
+
+	// If the context is canceled, close the listener to interrupt Accept()
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Close the listener; Accept() will return an error and the loop will exit.
+			listener.Close()
+		case <-closed:
+			// Normal shutdown of this function
+		}
+	}()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection on %s: %v", listenAddr, err)
-			continue
+			// If listener was closed due to context cancel, exit gracefully
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				return nil
+			}
+			// If it's a temporary error, retry a few times
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				log.Printf("Temporary accept error on %s: %v", listenAddr, err)
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			// Unrecoverable error
+			return fmt.Errorf("error accepting connection on %s: %v", listenAddr, err)
 		}
 
 		go handleConnection(conn, forwardAddr)
@@ -308,14 +356,27 @@ func handleConnection(clientConn net.Conn, forwardAddr string) {
 
 	// Enable TCP keepalive for better connection management
 	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetNoDelay(true) // Disable Nagle's algorithm for lower latency
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			log.Printf("Warning: failed to set keepalive on clientConn: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			log.Printf("Warning: failed to set keepalive period on clientConn: %v", err)
+		}
+		if err := tcpConn.SetNoDelay(true); err != nil { // Disable Nagle's algorithm for lower latency
+			log.Printf("Warning: failed to set no delay on clientConn: %v", err)
+		}
 	}
+
 	if tcpConn, ok := serverConn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		tcpConn.SetNoDelay(true)
+		if err := tcpConn.SetKeepAlive(true); err != nil {
+			log.Printf("Warning: failed to set keepalive on serverConn: %v", err)
+		}
+		if err := tcpConn.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			log.Printf("Warning: failed to set keepalive period on serverConn: %v", err)
+		}
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			log.Printf("Warning: failed to set no delay on serverConn: %v", err)
+		}
 	}
 
 	// Use a WaitGroup to ensure both goroutines complete
@@ -325,28 +386,37 @@ func handleConnection(clientConn net.Conn, forwardAddr string) {
 	// Forward client -> server
 	go func() {
 		defer wg.Done()
-		copyWithBuffer(serverConn, clientConn)
-		// Close the write side to signal EOF
+		err := copyWithBuffer(serverConn, clientConn)
+		// Only signal EOF if copy completed successfully
 		if tcpConn, ok := serverConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
+			if err == nil {
+				tcpConn.CloseWrite()
+			} else {
+				tcpConn.Close()
+			}
 		}
 	}()
 
 	// Forward server -> client
 	go func() {
 		defer wg.Done()
-		copyWithBuffer(clientConn, serverConn)
-		// Close the write side to signal EOF
+		err := copyWithBuffer(clientConn, serverConn)
+		// Only signal EOF if copy completed successfully
 		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
-			tcpConn.CloseWrite()
+			if err == nil {
+				tcpConn.CloseWrite()
+			} else {
+				tcpConn.Close()
+			}
 		}
 	}()
 
 	wg.Wait()
 }
 
-func copyWithBuffer(dst io.Writer, src io.Reader) {
+func copyWithBuffer(dst io.Writer, src io.Reader) error {
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
-	io.CopyBuffer(dst, src, *bufPtr)
+	_, err := io.CopyBuffer(dst, src, *bufPtr)
+	return err
 }
